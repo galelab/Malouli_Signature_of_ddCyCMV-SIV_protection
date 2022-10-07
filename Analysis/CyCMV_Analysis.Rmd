@@ -1,0 +1,1968 @@
+# 1.Read in files
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+setwd("./")
+counts= read.csv("count_matrix_10100_trimmed.txt", sep = "",header=T,row.names = 1, check.names=FALSE) 
+counts=counts[,1:80]
+targets = read.csv("O04CyCMV_Targets.csv", quote="", header=T, row.names=1)
+targets <- targets[order(row.names(targets)),]
+targets<-targets[1:80,]
+
+identical(rownames(targets), colnames(counts))
+
+```
+
+# Load Libraries
+```{r, echo=TRUE, message=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(dplyr)
+library(tibble)
+library(PCAtools)
+library(WebGestaltR)
+library(ggpubr)
+library(pcaExplorer)
+library(data.table)
+library(ExpressionNormalizationWorkflow)
+library(Biobase)
+library(biomaRt)
+library(ggplot2); theme_set(theme_bw())
+require(glmpca)
+library(ggfortify)
+library(openxlsx)
+source("heatmap2.F_rownames.R")
+```
+
+### Create annotation objects for pheatmap
+```{r pheatmap parameters, tidy=TRUE, tidy.opts=list(width.cutoff=40)}
+breaksList=seq(-4, 4, by = .1)
+contrasting2 = colorRampPalette(rev(c("deepskyblue3","skyblue","white","chocolate1","chocolate2")))(100)
+
+df = data.frame (
+  row.names = colnames(counts),
+  ID = targets$Animal_ID,
+  Sex= targets$Sex,
+  #TimePoint=targets$Time_Point,
+  Outcome=targets$Outcome  )
+
+annotation_colors = list(
+  ID =c(x36479 = "lightblue1", x36480 ="lightblue2", x36485 ="lightblue3", x36490 ="lightblue4", x36953 = "bisque1", x36957 = "bisque2", x36958 = "bisque3", x36959 ="bisque4"),
+  Sex = c(M = "grey90", 'F' = "grey50"),
+  Outcome=c(Protected="peachpuff2", Unprotected="peachpuff4"))
+#  Treatment = c(infected="steelblue4", control="steelblue1"))
+```
+
+
+# Limma
+First, let's filter out lowly expressed genes and check the average expression per sample
+```{r, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+y <- DGEList(counts=counts)
+A <- rowMeans(y$counts)
+isexpr <- A > 10
+y <- y[isexpr,]
+y <- calcNormFactors(y)
+dim(y)
+
+boxplot(log2(counts+1), col = targets$animal.ID, ylab = "log2 Expression", main = "Raw count_matrix", cex.axis=.6, las=2)
+boxplot(log2(y$counts+1), col = targets$animal.ID, ylab = "log2 Expression", main = "Filtered raw count_matrix", cex.axis=.6, las=2)
+
+plotDensities(log2(counts+1), legend = FALSE, levels(targets$animal.ID))
+plotDensities(log2(y$counts+1), legend = FALSE, levels(targets$animal.ID))
+
+```
+
+# Principal Variance Component Analysis 
+What is influencing the data?
+```{r, message=FALSE, echo=TRUE, tidy.opts=list(width.cutoff=60)}
+exprs <- y$counts
+covrts = read.csv("O04CyCMV_Targets.csv", quote="", header=T, row.names=1)
+covrts <- covrts[order(row.names(covrts)),]
+
+inpData <- expSetobj(exprs, covrts)
+cvrts_eff_var <- c("Animal_ID", "Age" , "Vaccine_Phase", "Sex", "Run","Time_Point","Outcome") ## Set the covariates whose effect size on the data needs to be calculated
+pct_thrsh <- 0.75
+
+pvcAnaly(inpData, pct_thrsh, cvrts_eff_var)
+```
+Animal ID and Sex have the biggest effects. We will control for Sex in the model below. Additionally, we will block on Animal ID to account for the repeated sampling of the same individuals.
+
+# Build the model and visualize the data
+```{r Design and transform data, message=FALSE, echo=TRUE, tidy.opts=list(width.cutoff=60)}
+ID <- factor(targets$Animal_ID, levels = unique(targets$Animal_ID))
+Sex <- factor(targets$Sex, levels = unique(targets$Sex))
+treatment <- factor(targets$Outcome_Time, levels = unique(targets$Outcome_Time))
+time <- factor(targets$Time_Point, levels = unique(targets$Time_Point))
+
+design <- model.matrix(~0 + time) 
+is.fullrank(design)
+nonEstimable(design)
+
+# Running voom & duplicateCorrelation twice is recommended by limma authors
+# https://support.bioconductor.org/p/114663/
+eset_voom  <- voom(y, 
+                   design=design,
+                   block=ID,
+                   normalize.method = "none",
+                   plot = T)
+
+corfit <- duplicateCorrelation(eset_voom,
+                              design,
+                              block=ID) # account for repeated sampling of individuals
+
+eset_voom  <- voom(y, 
+                   design=design,
+                   block=ID,
+                   correlation=corfit$consensus.correlation,
+                   normalize.method = "none",
+                   plot = T)
+
+corfit <- duplicateCorrelation(eset_voom,
+                              design,
+                              block=ID) 
+
+corfit$consensus.correlation
+
+norm_matrix <- eset_voom$E
+
+boxplot(eset_voom$E,  xlab=as.character(targets$Animal_ID),ylab = "log2 Expression", main = "Voom Transformed count_matrix", cex.axis=.6, las=2)
+
+
+dat.dist<-dist(t(eset_voom$E))
+plot(hclust(dat.dist, method="ward.D"),labels = targets$Outcome,cex=.75)
+
+
+#write.csv(norm_matrix, file="norm_matrix.csv")
+```
+
+# PCA
+```{r}
+contrasting2 = colorRampPalette(rev(c("chocolate2","chocolate1","white","skyblue","deepskyblue3")))(100)
+
+#Set rownames to sample names
+#rownames(targets) <- targets[ , 1]
+#targets <- targets[,-1]
+
+
+#Run PCA and Correlate PCs with Covariates
+p <- pca(nmCorrected, 
+         metadata = targets)
+
+pdf("O04CyCMV_EigencorPlot_10100.pdf", width=11, height=5)
+eigencorplot(p,
+             components = getComponents(p, seq_len(10)),
+             metavars = c('Animal_ID','Time_Point','Outcome','Sex'),
+             fontCorval = 2,
+             cexCorval=1.25,
+             col=contrasting2)
+dev.off()
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       colby='Outcome',
+       colkey = c('Protected'='firebrick3','Unprotected'='black'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE,
+       #lab=targets$Sample_Name,
+       lab=NULL,
+       pointSize = 4,
+       legendLabSize=16,
+       axisLabSize=20
+       )
+
+ggsave("O04CyCMV_PCA_10100_PC5_6.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=10, height=8, 
+       dpi=900, limitsize=TRUE)
+
+
+############ Make a cleaner looking PCA
+pc <- prcomp(t(norm_matrix))
+
+# plot PCA
+autoplot(pc,
+         data = targets, 
+         fill="Outcome", 
+         shape="Sex",
+         size=4,
+         x=1,
+         y=2) +
+        theme_bw()+
+        theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),
+              axis.text.x=element_text(face = "bold", size = 14, colour = "black"),
+              axis.text.y = element_text(face="bold", size=16, colour = "black"),
+              axis.title=element_text(size=14,face="bold", colour="black"),
+              legend.title = element_text(colour="black", size=16,face="bold"),
+              legend.text = element_text(colour="black", size=14,face="bold"))+
+        scale_shape_manual(values=c(23,21),
+                           name  ="Sex",
+                            breaks=c("F", "M")) +
+        scale_fill_manual(values = c("darkred", "grey")) +
+        guides(fill = guide_legend(override.aes=list(shape=22),reverse=TRUE))
+
+
+ggsave("CyCMV_PCA_Cleaner_PC5_PC6.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=7, height=5, 
+       dpi=900, limitsize=TRUE)
+
+# Save PCA object for underlying data
+Figure1A<-pc$x[,1:2]
+row.names(Figure1A)=sub("_RNA.*", "", row.names(Figure1A)) 
+```
+# Outcome separation is most pronounced in PC5-7.
+
+
+### Test for differential expression and plot co-expression heatmap of DE genes.
+```{r Linear model and differential expression, message=FALSE, echo=TRUE, tidy.opts=list(width.cutoff=60)}
+mm <- model.matrix(~0 + treatment + Sex) 
+is.fullrank(mm)
+nonEstimable(mm)
+
+fit <- lmFit(eset_voom,
+             mm,
+             block=ID, 
+             correlation=corfit$consensus)
+
+cont.matrix <- makeContrasts(
+  (treatmentProtected_D1_Prime - treatmentProtected_D0_Prime),
+  (treatmentProtected_D3_Prime - treatmentProtected_D0_Prime),
+  (treatmentProtected_D7_Prime - treatmentProtected_D0_Prime),
+  (treatmentProtected_D14_Prime -treatmentProtected_D0_Prime),
+  (treatmentProtected_BD0_Boost -treatmentProtected_D0_Prime),
+  (treatmentProtected_BD1_Boost -treatmentProtected_D0_Prime),
+  (treatmentProtected_BD3_Boost -treatmentProtected_D0_Prime),
+  (treatmentProtected_BD7_Boost -treatmentProtected_D0_Prime),
+  (treatmentProtected_BD14_Boost -treatmentProtected_D0_Prime),
+  (treatmentUnprotected_D1_Prime - treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_D3_Prime - treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_D7_Prime - treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_D14_Prime -treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_BD0_Boost -treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_BD1_Boost -treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_BD3_Boost -treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_BD7_Boost -treatmentUnprotected_D0_Prime),
+  (treatmentUnprotected_BD14_Boost -treatmentUnprotected_D0_Prime),
+levels=mm)
+
+cont.matrixBaseline <- makeContrasts(
+  (treatmentProtected_D0_Prime - treatmentUnprotected_D0_Prime),
+levels=mm)
+
+fit2 <- contrasts.fit(fit,cont.matrix)
+fitBaseline <- contrasts.fit(fit,cont.matrixBaseline)
+#fitUnp <- contrasts.fit(fit,cont.matrixUnp)
+
+
+fit2 <-eBayes(fit2, robust = FALSE) #Recommended to set as False when Sex included in model
+fitBaseline <-eBayes(fitBaseline, robust=FALSE)
+
+results <- decideTests(fit2, lfc=(.58), method="separate", adjust.method="BH", p.value=0.05)
+summary(results)
+
+
+resultsBaseline <- decideTests(fitBaseline, lfc=(.58), method="separate", adjust.method="BH", p.value=0.05)
+summary(resultsBaseline)
+
+
+write.fit(fit2, file="CyCMV_fullDE_results.csv", digits=3, method="separate", adjust="BH",sep=",")
+
+dataMatrix <- fit2$coefficients # Extract results of differential expression
+sigMask <- dataMatrix * (results**2) # 1 if significant, 0 otherwise
+ExpressMatrix <- subset(dataMatrix, rowSums(sigMask) != 0) # filter for significant genes
+
+# Filter sigMask to use for selecting DE genes from ExpressMatrix
+sigMask <- subset(sigMask, rowSums(sigMask) != 0)
+dim(sigMask)
+length(sigMask)
+
+colcolors <- c(
+    rep("black", 9),
+    rep("grey80", 9)
+)
+
+#pdf("CyCMV_GlobalDEheatmap.pdf", width=7, height=5)
+png("CyCMV_GlobalDEheatmap.png",width = 15, height = 12, units = 'in', res = 900)
+global_modules <- heatmap.F.rownames(ExpressMatrix, 
+                                     cutoff = 2, 
+                                     cutoffmethod = "depth",
+                                     distmethod = "euclidean", 
+                                     clustermethod = "ward.D", 
+                                     clusterdim='row',
+                                     colsep = 9,
+                                     cexCol = 4,
+                                     key=F,
+                                     labCol = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+                                                "D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+                                     labRow = FALSE)
+dev.off()
+
+# Write to object for Figures
+SupplementalFigure1<-global_modules
+
+#write modules to file for use in pathway enrichment analyses
+for (mod in unique(global_modules$modules)) {
+  gm<-as.data.frame(global_modules$modules)
+  gm<-gm %>% rownames_to_column('gene')
+  gm<-cbind(gm,global_modules$clustermatrix)
+  row.names(gm)<-NULL
+  tmp<-filter(gm, gm$`global_modules$modules`==mod)
+  tmp <- tmp %>% column_to_rownames('gene')
+  tmp$`global_modules$modules`<-NULL
+  filename<-paste('GlobalModules_CyCMV', mod, 'csv', sep = '.')
+  write.csv(tmp,file=filename)
+}
+
+contrasting3 = colorRampPalette(rev(c('darkblue', 'mediumblue', 'dodgerblue', 'white', 'orange', 'red', 'darkred')))(100)
+breaksList=seq(-3, 3, by = .1)
+
+pheatmap(ExpressMatrix,
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         clustering_method = "ward.D",
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = F, 
+         show_colnames = F,
+         breaks = breaksList,
+          border_color="black", 
+         angle_col = "45",
+         #cellwidth = 20,
+         #cellheight = 20,
+         fontsize_number = 18,
+         fontsize = 18,
+         cutree_rows = 5,
+         gaps_col = 9,
+         #annotation_col = annot, 
+         #annotation_colors = annotation_colors, 
+         main="DE Genes")
+
+
+```
+
+# HEatmap of DE Genes to highlight individual variation
+```{r}
+pheatmap(norm_matrix[row.names(ExpressMatrix),],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = F,
+         labels_col = as.character(targets$Time_Point),
+         angle_col=90,
+         show_rownames = F, show_colnames = T,
+         border_color=NA, 
+         #gaps_col = c(4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76),
+         clustering_method = "ward.D",
+         #cutree_cols = 5,
+        # breaks = breaksList,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="DE Genes")
+
+# Separate into Protected and Unprotected
+targetsProt<-targets[targets["Outcome"] ==  "Protected", ]
+targetsUnprot<-targets[targets["Outcome"] ==  "Unprotected", ]
+
+nm_prot<-norm_matrix[,colnames(norm_matrix) %in% row.names(targetsProt)]
+nm_unprot<-norm_matrix[,colnames(norm_matrix) %in% row.names(targetsUnprot)]
+
+pheatmap(nm_prot[row.names(ExpressMatrix),],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         labels_col = as.character(targetsProt$Time_Point),
+         angle_col=90,
+         show_rownames = F, show_colnames = T,
+         border_color=NA, 
+         #gaps_col = c(4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76),
+         clustering_method = "ward.D",
+         #cutree_cols = 5,
+        # breaks = breaksList,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="Protected DE Genes")
+
+pheatmap(nm_unprot[row.names(ExpressMatrix),],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         labels_col = as.character(targetsUnprot$Time_Point),
+         angle_col=90,
+         show_rownames = F, show_colnames = T,
+         border_color=NA, 
+         #gaps_col = c(4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76),
+         clustering_method = "ward.D",
+         #cutree_cols = 5,
+        # breaks = breaksList,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="Unprotected DE Genes")
+```
+
+
+
+### Plot a barplot of the total number of DE genes in the experiment
+```{r DE Genes Histogram, echo=TRUE, message = FALSE, fig.width=11, fig.height=9}
+# Reshape data frame for ggplot2 requirements
+results_t <- t(summary(results))
+results_t <- results_t[,-2]
+
+for (i in 1:(length(row.names(results_t)))) {
+  results_t[i, 1] <- results_t[i, 1] * -1
+}
+
+DE <- as.data.frame(results_t)
+DE <- setnames(DE, old=c("Var1","Var2", "Freq"), new=c("Time_Point", "Expression", "DE_genes"))
+
+#Create plot
+ggplot(DE, aes(x=Time_Point, y=DE_genes, fill=Expression, label = DE$DE_genes))+  
+  geom_bar(stat="identity", position="identity")+
+  scale_fill_manual(values = c("steelblue4", "chocolate3")) +
+  ylab("") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5, size=14,face="bold",colour = "black"),
+        axis.text.y=element_text(size=14,face="bold",colour = "black"),
+        axis.ticks = element_line(colour = "black"),
+        axis.title=element_text(size=14,face="bold"))+
+  theme(legend.position = "none")+
+  scale_x_discrete(labels=c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+              "D3","D7","D14","BD0","BD1","BD3","BD7","BD14"))+
+  geom_vline(xintercept = c(9.48))+
+  geom_vline(xintercept = c(4.48,13.48),linetype="dashed")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+
+ggsave("DE_Genes_BarPlots.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=6, height=3, 
+       dpi=900, limitsize=TRUE)
+
+Figure1B<-DE
+Figure1B$Time_Point<-c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+              "D3","D7","D14","BD0","BD1","BD3","BD7","BD14",
+              "D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+              "D3","D7","D14","BD0","BD1","BD3","BD7","BD14")
+Figure1B$Outcome<-c(rep("Protected", 9),
+                    rep("Unprotected", 9),
+                    rep("Protected", 9),
+                    rep("Unprotected", 9))
+
+Figure1B$Phase<-c(rep("Prime", 4),
+                    rep("Boost", 5),
+                   rep("Prime", 4),
+                    rep("Boost", 5),
+                  rep("Prime", 4),
+                    rep("Boost", 5),
+                  rep("Prime", 4),
+                    rep("Boost", 5)
+                  )
+```
+
+### Let's now perform DDE analysis, which is essentially an interaction model of outcome and timepoint. This directly compares protected and unproctected groups while accounting for their respective baselines. This is a stringent test compared to DE above.
+```{r DDE, echo=TRUE, message = FALSE, fig.width=11, fig.height=9}
+cont.matrixDDE <- makeContrasts(
+  "((treatmentProtected_D1_Prime - treatmentProtected_D0_Prime) - (treatmentUnprotected_D1_Prime - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_D3_Prime - treatmentProtected_D0_Prime) - (treatmentUnprotected_D3_Prime - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_D7_Prime - treatmentProtected_D0_Prime) - (treatmentUnprotected_D7_Prime - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_D14_Prime - treatmentProtected_D0_Prime) - (treatmentUnprotected_D14_Prime - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_BD0_Boost - treatmentProtected_D0_Prime) - (treatmentUnprotected_BD0_Boost - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_BD1_Boost - treatmentProtected_D0_Prime) - (treatmentUnprotected_BD1_Boost - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_BD3_Boost - treatmentProtected_D0_Prime) - (treatmentUnprotected_BD3_Boost - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_BD7_Boost - treatmentProtected_D0_Prime) - (treatmentUnprotected_BD7_Boost - treatmentUnprotected_D0_Prime))",
+  "((treatmentProtected_BD14_Boost - treatmentProtected_D0_Prime) - (treatmentUnprotected_BD14_Boost - treatmentUnprotected_D0_Prime))",
+  levels=mm)
+
+fitDDE <- contrasts.fit(fit,cont.matrixDDE)
+fitDDE <-eBayes(fitDDE, robust=FALSE)
+results <- decideTests(fitDDE, lfc=(.58), method="separate", adjust.method="BH", p.value=0.05)
+summary(results) # nothing
+#write.fit(fitDDE, file="CyCMV_DDE.txt", digits=3, method="global", adjust="BH")
+```
+
+# DDE results might still tell us something via GSEA. Let's look.
+```{r}
+#Convert to gene symbol
+rescy <- read.csv("CyCMV_DDE.txt",row.names=1,sep="\t")
+
+mmulatta_ensembl <- useDataset("mmulatta_gene_ensembl", useMart("ensembl"))
+gene_list <- getBM(filters = "ensembl_gene_id", 
+                   attributes = c("ensembl_gene_id","hsapiens_homolog_ensembl_gene","hsapiens_homolog_orthology_type","hsapiens_homolog_associated_gene_name"),
+                   values = row.names(norm_matrix),mart = mmulatta_ensembl)
+gene_list<-gene_list[gene_list["hsapiens_homolog_orthology_type"] ==  "ortholog_one2one", ]
+gene_list$hsapiens_homolog_orthology_type<-NULL
+
+rescy_symbol<-merge(rescy,gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+rescy_symbol<-rescy_symbol[,c(42,1:41)]
+rescy_symbol$Row.names <-NULL
+rescy_symbol$hsapiens_homolog_ensembl_gene <-NULL
+rescy_symbol <-avereps(rescy_symbol,ID=rescy_symbol$hsapiens_homolog_associated_gene_name)
+row.names(rescy_symbol) <- rescy_symbol[,1]
+rescy_symbol <- rescy_symbol[,-1]
+#write.csv(rescy_symbol,file="DDE_results_GeneSymbol.csv")
+
+# Output norm matrix with gene symbol while we are at it
+norm_matrix_symbol<-merge(norm_matrix,gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+norm_matrix_symbol<-norm_matrix_symbol[,c(83,1:81)]
+norm_matrix_symbol$Row.names <-NULL
+norm_matrix_symbol <-avereps(norm_matrix_symbol,ID=norm_matrix_symbol$hsapiens_homolog_associated_gene_name)
+row.names(norm_matrix_symbol) <- norm_matrix_symbol[,1]
+norm_matrix_symbol <- norm_matrix_symbol[,-1]
+write.csv(norm_matrix_symbol,file="NormMatrix_GeneSymbol.csv")
+
+# Output .rnk files for GSEA
+rescy_symbol2<-rescy_symbol[,c(11:19)]
+rescy_symbol2<-as.data.frame(rescy_symbol2)
+names(rescy_symbol2) <- substring(names(rescy_symbol2),1,27) #webgestalt can't handle long file names
+
+
+for (i in colnames(rescy_symbol2)) {
+  tempdf <- data.frame(row.names(rescy_symbol2), rescy_symbol2[i])
+  tempdf <- tempdf[order(tempdf[,2],decreasing=TRUE),]
+  tempdf <- tempdf[complete.cases(tempdf),]
+  write.table(tempdf,sep="\t",row.names=FALSE, col.names = FALSE, quote=FALSE, paste0(i, ".rnk"))
+}
+
+#Perform GSEA on each .rnk file after moving to a central GSEA directory
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/")
+for (FILE in list.files("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/")) {
+WebGestaltR(enrichMethod="GSEA",
+              organism="hsapiens",
+              interestGeneFile=FILE,
+              projectName = FILE,
+              saveRawGseaResult=FALSE,
+              isOutput = TRUE,
+              minNum=10,
+              interestGeneType="genesymbol",
+              enrichDatabase = c("community-contributed_Hallmark50",
+                                 "pathway_KEGG"),
+              enrichDatabaseType = "genesymbol",
+              sigMethod = "fdr", fdrMethod = "BH", fdrThr = 1, nThreads=8)
+}
+
+
+# Same GSEA but with the RhCMV/SIV Sigs
+# Let's first generate a random gene list, the same size as the RhCMV sigs to include
+# 104 for Up, 57 for down
+nm_symbol<-read.csv("NormMatrix_GeneSymbol.csv",row.names=1,header=T)
+
+set.seed(8762)
+random_up<-t(nm_symbol[sample(nrow(nm_symbol), 104), ])
+random_down<-t(nm_symbol[sample(nrow(nm_symbol), 57), ])
+write.table(random_up,file="RandomGeneSet_up_104.txt",sep="\t")
+write.table(random_down,file="RandomGeneSet_down_57.txt",sep="\t")
+
+
+
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Hallamrks_DDE/")
+for (FILE in list.files("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Hallamrks_DDE/")) {
+WebGestaltR(enrichMethod="GSEA",
+              organism="hsapiens",
+              interestGeneFile=FILE,
+              projectName = FILE,
+              saveRawGseaResult=FALSE,
+              isOutput = TRUE,
+              minNum=10,
+              interestGeneType="genesymbol",
+              enrichDatabaseFile = "z:/Users/dnewho/Scripts/GSEA_GeneSets/Hallmarks_DDE.gmt",
+              enrichDatabaseType = "genesymbol",
+              sigMethod = "fdr", fdrMethod = "BH", fdrThr = 1, nThreads=8)
+}
+
+
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Hallmarks_DDE_Random_All/")
+for (FILE in list.files("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Hallmarks_DDE_Random_All/")) {
+WebGestaltR(enrichMethod="GSEA",
+              organism="hsapiens",
+              interestGeneFile=FILE,
+              projectName = FILE,
+              saveRawGseaResult=FALSE,
+              isOutput = TRUE,
+              minNum=10,
+              interestGeneType="genesymbol",
+              enrichDatabaseFile = "z:/Users/dnewho/Scripts/GSEA_GeneSets/Hallmarks_DDE_random.gmt",
+              enrichDatabaseType = "genesymbol",
+              sigMethod = "fdr", fdrMethod = "BH", fdrThr = 1, nThreads=8)
+}
+
+
+### Volcano Plot of Interesting Results
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Project_t___treatmentProtected_D1_P_rnk/")
+pd1_res<-read.csv("enrichment_results_t___treatmentProtected_D1_P_rnk.txt", sep="\t")
+
+
+pdf(file="PrimeDay1_GSEA_Volcano.pdf",width=6,height=6)
+with(pd1_res, plot(normalizedEnrichmentScore, -log10(FDR+0.000001), 
+                pch=21, col="gray90", bg="grey", main="", cex.main=.8, 
+               #ylim=c(0,6),xlim=c(-7,7), 
+                xlab="Normalized Enrichment Score", ylab="-Log10 (FDR)"))
+with(subset(pd1_res, normalizedEnrichmentScore >0.01 & FDR <.05), points(normalizedEnrichmentScore, -log10(FDR+0.000001), pch=21, col="black", bg="chocolate1"))
+with(subset(pd1_res, normalizedEnrichmentScore <0.01 & FDR <.05), points(normalizedEnrichmentScore, -log10(FDR), pch=21, col="black", bg="steelblue"))
+#with(subset(nw_res, enrichmentRatio > 3.7 & FDR <.01), text(enrichmentRatio, -log10(FDR), labels="Interferon Gamma Response", font=3,pos=1))
+#with(subset(nw_res, enrichmentRatio < 3.6 & FDR <.01), text(enrichmentRatio, -log10(FDR), labels=c("Inflammation"), font=3,pos=4))
+abline(h=1.3,lty=2)
+dev.off()
+
+
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Project_t___treatmentProtected_BD1__rnk/")
+bd1_res<-read.csv("enrichment_results_t___treatmentProtected_BD1__rnk.txt", sep="\t")
+
+pdf(file="BoostDay1_GSEA_Volcano.pdf",width=6,height=6)
+with(bd1_res, plot(normalizedEnrichmentScore, -log10(FDR+0.000001), 
+                pch=21, col="gray90", bg="grey", main="", cex.main=.8, 
+                #ylim=c(0,6),xlim=c(-7,3), 
+                xlab="Normalized Enrichment Score", ylab="-Log10 (FDR)"))
+with(subset(bd1_res, normalizedEnrichmentScore >0.01 & FDR <.05), points(normalizedEnrichmentScore, -log10(FDR+0.000001), pch=21, col="black", bg="chocolate1"))
+with(subset(bd1_res, normalizedEnrichmentScore <0.01 & FDR <.05), points(normalizedEnrichmentScore, -log10(FDR+0.000001), pch=21, col="black", bg="steelblue"))
+#with(subset(nw_res, enrichmentRatio > 3.7 & FDR <.01), text(enrichmentRatio, -log10(FDR), labels="Interferon Gamma Response", font=3,pos=1))
+#with(subset(nw_res, enrichmentRatio < 3.6 & FDR <.01), text(enrichmentRatio, -log10(FDR), labels=c("Inflammation"), font=3,pos=4))
+abline(h=1.3,lty=2)
+dev.off()
+
+## LEt's Take the top hits from GSEA and make a heatmap of some of the top contributing genes
+pd1genes<-read.table("PrimeDay1_GSEA_Genes.txt")
+pd1genes<-pd1genes[,1]
+bd1genes<-read.table("BoostDay1_Genes.txt")
+bd1genes<-bd1genes[,1]
+
+em_symbol<-merge(dataMatrix,gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+em_symbol<-em_symbol[,c(21,1:20)]
+em_symbol$Row.names<-NULL
+em_symbol$hsapiens_homolog_orthology_type<-NULL
+em_symbol$hsapiens_homolog_ensembl_gene<-NULL
+em_symbol <-avereps(em_symbol,ID=em_symbol$hsapiens_homolog_associated_gene_name)
+row.names(em_symbol)<-em_symbol[,1]
+em_symbol<-as.matrix(em_symbol)
+em_symbol<-em_symbol[,-1]
+class(em_symbol)<-"numeric"
+
+pdf("PrimeDay1GSEA_Genes.pdf",width = 10,height=10)
+pheatmap(em_symbol[pd1genes,],
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         clustering_method = "ward.D",
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = T, 
+         show_colnames = F,
+         breaks = breaksList,
+        border_color="black", 
+         angle_col = "45",
+         cellwidth = 20,
+         cellheight = 20,
+         fontsize_number = 18,
+         fontsize = 18,
+         gaps_col = 9,
+         main="Prime Day 1")
+dev.off()
+
+pdf("BoostDay1GSEA_Genes.pdf",width = 10,height=5)
+pheatmap(em_symbol[bd1genes,],
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         clustering_method = "ward.D",
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = T, 
+         show_colnames = F,
+         breaks = breaksList,
+        border_color="black", 
+         angle_col = "45",
+         cellwidth = 20,
+         cellheight = 20,
+         fontsize_number = 18,
+         fontsize = 18,
+         gaps_col = 9,
+         main="Boost Day 1")
+dev.off()
+```
+
+# GSEA Heatmap
+```{r}
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Hallamrks_DDE/")
+
+files <- dir(recursive=TRUE, full.names=TRUE, pattern="enrichment_results*")
+lst <- lapply(files, read.csv, header=TRUE, sep="\t", stringsAsFactors=FALSE)
+lst1 <- lapply(lst, "[", c("geneSet","normalizedEnrichmentScore"))
+
+DF <-as.data.frame(lst1[[1]])
+for ( .df in lst1 ) {
+  DF <-merge(DF,.df,by="geneSet", all=T)
+}
+
+DF<-avereps(x = DF,ID = DF$geneSet)
+
+DF[is.na(DF)] <- 0
+row.names(DF) <-DF[,1]
+#DF$description <- NULL
+DF <- DF[,c(-1,-2)] # removes "description" and duplicated first column
+
+colnames(DF) = files
+
+DFm<-as.matrix(DF)
+row.names(DFm)=sub("HALLMARK_", "", row.names(DFm)) 
+
+#DFm<-DFm[,c(4,1,2,3)]
+class(DFm)<-"numeric"
+breaksList=seq(-3.5, 3.5, by = .1)
+contrasting2 = colorRampPalette(rev(c("royalblue4","steelblue1","white","sienna1","darkred")))(100)
+
+
+pdf("GSEA_Heatmap.pdf",width = 10,height=10)
+pheatmap(DFm[,c(6,8,9,7,1,2,4,5,3)],
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting2)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = T, 
+         show_colnames = T,
+         border_color= "grey70", 
+         breaks = breaksList,
+        labels_col = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+        gaps_col = 5,
+         angle_col = 45,
+         fontsize = 12,
+         main=""
+         )
+dev.off()
+
+
+###### With the random gene sets
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DDE_GSEA/Hallmarks_DDE_Random/")
+
+files <- dir(recursive=TRUE, full.names=TRUE, pattern="enrichment_results*")
+lst <- lapply(files, read.csv, header=TRUE, sep="\t", stringsAsFactors=FALSE)
+lst1 <- lapply(lst, "[", c("geneSet","normalizedEnrichmentScore"))
+
+DF <-as.data.frame(lst1[[1]])
+for ( .df in lst1 ) {
+  DF <-merge(DF,.df,by="geneSet", all=T)
+}
+
+#DF<-avereps(x = DF,ID = DF$geneSet)
+
+DF[is.na(DF)] <- 0
+row.names(DF) <-DF[,1]
+#DF$description <- NULL
+DF <- DF[,c(-1,-2)] # removes "description" and duplicated first column
+
+colnames(DF) = files
+
+DFm<-as.matrix(DF)
+row.names(DFm)=sub("HALLMARK_", "", row.names(DFm)) 
+
+#DFm<-DFm[,c(4,1,2,3)]
+class(DFm)<-"numeric"
+breaksList=seq(-3.5, 3.5, by = .1)
+contrasting2 = colorRampPalette(rev(c("royalblue4","steelblue1","white","sienna1","darkred")))(100)
+
+
+pdf("GSEA_Heatmap_withRandomSets.pdf",width = 10,height=10)
+pheatmap(DFm[,c(6,8,9,7,1,2,4,5,3)],
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting2)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = T, 
+         show_colnames = T,
+         border_color= "grey70", 
+         breaks = breaksList,
+        labels_col = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+        gaps_col = 5,
+         angle_col = 45,
+         fontsize = 12,
+         main=""
+         )
+dev.off()
+```
+
+
+# Now, let's investigate the Protection Signature characterized from RhCMV/SIV in the CyCMV/SIV data.
+```{r, echo=TRUE, message = FALSE, fig.width=11, fig.height=9}
+# Read in CyCMV DE genes if starting here
+#ExpressMatrix<-read.csv("ExpressMatrix_GLOBAL_CyCMV_DE.csv", 
+#                          header=TRUE, 
+#                          sep=",", 
+#                          row.names=1, 
+#                          as.is=TRUE)
+
+# Read in RhCMV DDE Genes
+RhDDE_genes <-read.xlsx("../Updated_RhCMV_Sigs/DDE_Genes_TableS2.xlsx", 
+                        sheet=1,
+                        rowNames=T)
+
+RhDDE_genes_LFC=RhDDE_genes[,c(1:8)]
+RhCMV_genes <-row.names(RhDDE_genes)
+
+# Get DE values for DDE genes
+RhDElfc<-read.csv("../../Freddy_Protective_Signatue/SO_full_expression_matrix_de_lm.csv",row.names=1)
+RhDElfc<-RhDElfc[RhCMV_genes,]
+
+
+# Identify DDE genes that are EXPRESSED (not necesarily DE) in the CyCMV data
+overlap_full <- RhDDE_genes[row.names(norm_matrix),] 
+overlap_full<-row.names(as.matrix(overlap_full[!grepl('NA', rownames(overlap_full)), ])) #1750 genes
+
+# Identify DDE genes that are DIFFERENTIALLY EXPRESSED in the CyCMV data
+overlap_DE <- RhDDE_genes[row.names(ExpressMatrix),] 
+overlap_DE<-row.names(as.matrix(overlap_DE[!grepl('NA', rownames(overlap_DE)), ])) #542 genes
+
+
+df = data.frame (
+  row.names = colnames(norm_matrix),
+  Outcome=targets$Outcome,
+  #Time_Point = targets$Time_Point,
+  Sex= targets$Sex,
+  ID=targets$Animal_ID)
+  
+
+annotation_colors = list(
+  ID =c(x36479 = "lightblue1", x36480 ="lightblue2", x36485 ="lightblue3", x36490 ="lightblue4", x36953 = "bisque1", x36957 = "bisque2", x36958 = "bisque3", x36959 ="bisque4"),
+  Sex = c(M = "grey90", 'F' = "grey50"),
+  #Time_Point=c(D0="#7F3B08",D1="#B35806",D3="#E08214",D7="#FDB863",D14="#FEE0B6",BD0="#F7F7F7",BD1="#D8DAEB",DX2="#B2ABD2",BD7="#8073AC",DX1="#542788",BD3="#2D004B"),
+  Outcome=c(Protected="peachpuff2", Unprotected="peachpuff4"))
+#  Treatment = c(infected="steelblue4", control="steelblue1"))
+
+
+pheatmap(norm_matrix[overlap_full,],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting2)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         labels_col = as.character(targets$Time_Point),
+         angle_col=90,
+         show_rownames = F, show_colnames = T,
+         border_color=NA, 
+         gaps_col = c(4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76),
+         clustering_method = "ward.D",
+         #cutree_cols = 5,
+        # breaks = breaksList,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="Overlap Full 1750 Genes")
+
+pheatmap(norm_matrix[overlap_DE,],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting2)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         labels_col = as.character(targets$Time_Point),
+         angle_col=90,
+         show_rownames = F, show_colnames = T,
+         border_color=NA, 
+         gaps_col = c(4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76),
+         clustering_method = "ward.D",
+         #cutree_cols = 5,
+         #breaks = breaksList,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="Overlap 542 DE Genes")
+
+colcolors <- c(
+    rep("black", 9),
+    rep("grey80", 9)
+)
+
+
+# Freddy Heatmap with DE LFC values
+pdf("CyCMV_RhCMV_DE_Overlap_heatmap_djn.pdf", width=5, height=4)
+global_modules <- heatmap.F.rownames(ExpressMatrix[overlap_DE,], 
+                                     cutoff = 2, 
+                                     distmethod = "bicor", 
+                                     clustermethod = "ward.D", 
+                                     clusterdim='row',
+                                     colsep = c(9),
+                                     cexCol = 1,
+                                     key=F,
+                                    # ColSideColors = colcolors,
+                                     labCol = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+                                                "D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+                                     labRow = FALSE)
+dev.off()
+
+#write modules to file for use in pathway enrichment analyses
+for (mod in unique(global_modules$modules)) {
+  gm<-as.data.frame(global_modules$modules)
+  gm<-gm %>% rownames_to_column('gene')
+  gm<-cbind(gm,global_modules$clustermatrix)
+  row.names(gm)<-NULL
+  tmp<-filter(gm, gm$`global_modules$modules`==mod)
+  tmp <- tmp %>% column_to_rownames('gene')
+  tmp$`global_modules$modules`<-NULL
+  filename<-paste('GlobalModules_CyCMV_RhCMVoverlap', mod, 'csv', sep = '.')
+  write.csv(tmp,file=filename)
+}
+
+# Combine CyCMV and RhCMV expression values together to make heatmap
+cy<-as.data.frame(dataMatrix)
+CyRh <-merge(cy, RhDElfc, by='row.names')
+rownames(CyRh) <- CyRh[ , 1]
+CyRh <- CyRh[,-1]
+CyRh<-CyRh[,c(1:18,19:26,35:42,27:34,43:50)]
+CyRh <-as.matrix(CyRh)
+class(CyRh) <- "numeric"
+
+colcolors <- c(
+    rep("black", 9),
+    rep("grey80", 9),
+    rep("darkred", 8),
+    rep("tan", 8),
+    rep("darkred", 8),
+    rep("tan", 8)
+)
+
+pdf("RhDDE_Genes_inCyno.pdf", width=5, height=7)
+global_modules <- heatmap.F.rownames(CyRh, 
+                                     cutoff = 3, 
+                                     distmethod = "euclidean", 
+                                     clustermethod = "ward.D", 
+                                     clusterdim='row',
+                                     colsep = c(9,18,26,34,42),
+                                     cexCol = 1.5,
+                                     key=F,
+                                     ColSideColors = colcolors,
+                                     labCol = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+                                              "D3","D7","D14","BD0","BD1","BD3","BD7","BD14","W0D1", "W0D3",
+                                              "W0D7","W18D0","W18D1","W18D3","W18D7","W88D0","W0D1", "W0D3",
+                                              "W0D7","W18D0","W18D1","W18D3","W18D7","W88D0","W0D1", "W0D3",
+                                              "W0D7","W18D0","W18D1","W18D3","W18D7","W88D0","W0D1", "W0D3",
+                                              "W0D7","W18D0","W18D1","W18D3","W18D7","W88D0"),
+
+                                     labRow = FALSE)
+dev.off()
+
+
+
+#write.csv(global_modules, file="EM_368_overlap_modules.csv")
+nm_hgnc <- merge(rhesus2human, global_modules, by.x='Gene.stable.ID', by.y='row.names')
+nm_hgnc <- avereps(nm_hgnc, ID = nm_hgnc$Gene.stable.ID)
+row.names(nm_hgnc) <- unique(nm_hgnc[,1])
+row.names(nm_hgnc) <-nm_hgnc[,2]
+#write.csv(nm_hgnc, file="EM_368_overlap_modules_HGNC.csv")
+
+
+
+```
+
+
+# Edlefsen 40 gene signature.
+### 1 gene could not be converted to Ensembl
+### 2 genes not expressed in CyCMV
+```{r, echo=TRUE, message = FALSE, fig.width=11, fig.height=9}
+pe40 <-read.csv("../Edlefsen_30gene_Sig.csv", header=TRUE,  as.is=TRUE, row.names=1)
+pe40 <-row.names(pe40)
+pe40<-intersect(row.names(norm_matrix),pe40)
+
+# Let's look at expression of these features in our data
+pheatmap(norm_matrix[pe40,],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting2)))(length(breaksList)),
+         cluster_rows = F,
+         cluster_cols = T,
+         labels_col = as.character(targets$Time_Treatment_Sex_ID),
+         show_rownames = F, show_colnames = T,
+         border_color=NA, 
+         clustering_method = "ward.D2",
+         #cutree_cols = 5,
+         #breaks = breaksList,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="Paul Edlefsen Genes")
+
+pe9 <-c("ENSMMUG00000032424","ENSMMUG00000013253","ENSMMUG00000019304","ENSMMUG00000021545","ENSMMUG00000031296","ENSMMUG00000009852","ENSMMUG00000021649","ENSMMUG00000005946","ENSMMUG00000044652")
+
+pe9.1 <- read.csv("edlefsen_9genes.csv")
+pe9.1 <-as.matrix(pe9.1)
+
+EMpe9<- as.data.frame(ExpressMatrix)
+EMrbm <-merge(EMpe9, pe9.1, by.x='row.names', by.y='rbm')
+rownames(EMrbm) <- EMrbm[ , 1]
+EMrbm <- EMrbm[,-1]
+EMrbm <-as.matrix(EMrbm)
+global_modules <- heatmap.F.rownames(EMrbm, 
+                                     cutoff = 1, 
+                                     distmethod = "euclidean", clustermethod = "ward.D", 
+                                     clusterdim='row',
+                                     colsep = c(9,18),
+                                     ColSideColors = TRUE,
+                                     cexCol = 1,
+                                     key=F,
+                                     labCol = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+                                                "D3","D7","D14","BD0","BD1","BD3","BD7","BD14", "W0D1", "W0D3",
+                                                "W0D7","W18D0","W18D1","W18D3","W18D7","W88D0"),
+                                     labRow = FALSE)
+
+
+
+
+# Hierarchical Clustering to see if samples separate by Outcome using these genes
+dat.dist<-dist(t(norm_matrix[pe40,]))
+plot(hclust(dat.dist, method="ward.D2"),labels = targets$Outcome, cex=.75)
+
+```
+
+
+# Next, we will invesitgate the RhCMV IL15 signature in the CyCMV data.
+###  In vivo IL15 data (Whole Blood)
+# We will check the overlap with the in vivo data where the RhCMV IL15 protection signature was fully developed.
+
+### IL15 Whole Blood overlap.
+```{r, echo=TRUE, message = FALSE, fig.width=11, fig.height=9}
+il15_rhcmv <- read.csv("Z:/Users/dnewho/Freddy_Protective_Signatue/IL15_expression_matrix_de_lm.csv",row.names = 1)
+il15_day1<-read.csv("Z:/Users/dnewho/Freddy_Protective_Signatue/D1_IL15_both.csv")
+
+il15_day1_em<-il15_rhcmv[il15_day1$gene,1, drop=F]
+
+mm <-merge(ExpressMatrix, il15_day1_em, by.x='row.names', by.y='row.names')
+rownames(mm) <- mm[ , 1]
+mm <- mm[,-1]
+mm <-as.matrix(mm)
+class(mm) <- "numeric"
+mm<-mm[,c(19,1:18)] # place IL-15 column next to cyno protected
+
+
+pdf("CyCMV_DEGenes_Overlap_with_AllRhesus_IL15_Day1.pdf", width=10, height=8)
+global_modules <- heatmap.F.rownames(mm, 
+                                     cutoff = 2, 
+                                     distmethod = "euclidean", 
+                                     clustermethod = "ward.D", 
+                                     clusterdim='row',
+                                     #colsep = c(9,18,26,34,42,50),
+                                     colsep = c(1,10),
+                                     cexCol = 1.5,
+                                     key=T,
+                                     labCol = c("Rh IL15 D1","D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14","D1",
+                                                "D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+                                     labRow = FALSE)
+dev.off()
+
+#write.csv(global_modules, file="IL15/IL15rhcmv_cycmv_overlap_coexpression_il15_only.csv")
+#breaksList2=seq(-6, 6, by = .1)
+
+df = data.frame (
+  row.names = colnames(ExpressMatrix),
+  Outcome=rep(c("Protected","Unprotected"),each= 9) )
+
+annotation_colors = list(
+  Outcome=c(Protected="darkred", Unprotected="grey"))
+
+
+pdf("CyCMV_DEGenes_Overlap_with_AllRhesus_IL15_Day1.pdf", width=8, height=4)
+pheatmap(mm,
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         clustering_method = "ward.D",
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = F, 
+         show_colnames = T,
+         labels_col = c("RM IL15 D1","D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14",
+                        "D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+         breaks = breaksList,
+        #  border_color="black", 
+         angle_col = "90",
+         #cellwidth = 20,
+         #cellheight = 20,
+         fontsize_number = 11,
+         fontsize = 18,
+         cutree_rows = 3,
+         gaps_col = c(1,10),
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+        annotation_legend=F,
+         main="")
+dev.off()
+```
+
+Quick PCA of the IL15 overlap genes.
+Eigencorplot shows that PC5 and PC11 are correlated with outcome. PC1 & PC2 are mostly time point and random variation.
+```{r PCA of IL15 overlap, echo=TRUE, message = FALSE, fig.width=11, fig.height=9}
+rownames(targets) <- targets[ , 1]
+targets2 <- targets[,-1]
+
+il15genes <-row.names(global_modules)
+
+p <- pca(norm_matrix[il15genes,], metadata = targets2)
+eigencorplot(p,
+             components = getComponents(p, seq_len(11)),
+             metavars = c('Animal_ID','Time_Point','Outcome','Sex','Outcome_Time'),
+             col=contrasting2)
+
+biplot(p, x='PC1', y='PC2', lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='darkorange','Unprotected'='skyblue3'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+biplot(p, x='PC5', y='PC11', lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='darkorange','Unprotected'='skyblue3'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+```
+
+Cleaner PCA of all genes
+```{r PCA, echo=TRUE, message = FALSE, fig.width=11, fig.height=9}
+rownames(targets) <- targets[ , 1]
+targets2 <- targets[,-1]
+
+
+nm_de<-norm_matrix[row.names(ExpressMatrix),]
+p <- pca(nm_de, metadata = targets2)
+eigencorplot(p,
+             components = getComponents(p, seq_len(11)),
+             metavars = c('Animal_ID','Time_Point','Outcome','Sex','Outcome_Time'),
+             col=contrasting2)
+
+PCAtools::biplot(p, x='PC1', y='PC2', lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='black','Unprotected'='grey80'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+```
+
+
+# GSEA of DE Genes
+## GO, KEGG, Hallmarks give us pathway/functional insights
+## Nakaya gene sets give us info about cell types
+```{r}
+#Convert to gene symbol
+rescy <- read.csv("CyCMV_fullDE_results.csv",row.names=1,sep=",")
+
+mmulatta_ensembl <- useDataset("mmulatta_gene_ensembl", useMart("ensembl"))
+gene_list <- getBM(filters = "ensembl_gene_id", 
+                   attributes = c("ensembl_gene_id","hsapiens_homolog_ensembl_gene","hsapiens_homolog_orthology_type","hsapiens_homolog_associated_gene_name"),
+                   values = row.names(norm_matrix),mart = mmulatta_ensembl)
+gene_list<-gene_list[gene_list["hsapiens_homolog_orthology_type"] ==  "ortholog_one2one", ]
+gene_list$hsapiens_homolog_orthology_type<-NULL
+
+rescy_symbol<-merge(rescy,gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+rescy_symbol<-rescy_symbol[,c(78,1:77)]
+rescy_symbol$Row.names <-NULL
+rescy_symbol$hsapiens_homolog_ensembl_gene <-NULL
+rescy_symbol <-avereps(rescy_symbol,ID=rescy_symbol$hsapiens_homolog_associated_gene_name)
+row.names(rescy_symbol) <- rescy_symbol[,1]
+rescy_symbol <- rescy_symbol[,-1]
+#write.csv(rescy_symbol,file="DDE_results_GeneSymbol.csv")
+
+# Output .rnk files for GSEA
+rescy_symbol2<-rescy_symbol[,c(20:37)]
+rescy_symbol2<-as.data.frame(rescy_symbol2)
+names(rescy_symbol2) <- substring(names(rescy_symbol2),1,28) #webgestalt can't handle long file names
+
+
+for (i in colnames(rescy_symbol2)) {
+  tempdf <- data.frame(row.names(rescy_symbol2), rescy_symbol2[i])
+  tempdf <- tempdf[order(tempdf[,2],decreasing=TRUE),]
+  tempdf <- tempdf[complete.cases(tempdf),]
+  write.table(tempdf,sep="\t",row.names=FALSE, col.names = FALSE, quote=FALSE, paste0("DE_GSEA/",i, ".rnk"))
+}
+
+
+
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/")
+for (FILE in list.files("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/")) {
+WebGestaltR(enrichMethod="GSEA",
+              organism="hsapiens",
+              interestGeneFile=FILE,
+              projectName = FILE,
+              saveRawGseaResult=TRUE,
+              isOutput = TRUE,
+              minNum=10,
+              interestGeneType="genesymbol",
+              #enrichDatabase = c("geneontology_Biological_Process_noRedundant",
+              #                   "geneontology_Molecular_Function_noRedundant",
+              #                   "geneontology_Cellular_Component_noRedundant",
+              #                   "community-contributed_Hallmark50",
+              #                   "pathway_KEGG"),
+              enrichDatabaseFile = "Z:/Users/dnewho/Scripts/GSEA_GeneSets/Nakaya2011.gmt",
+              enrichDatabaseType = "genesymbol",
+              sigMethod = "fdr", fdrMethod = "BH", fdrThr = 0.05, nThreads=4)
+}
+
+# LEts also test against RM protective signatures for reference.
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DE_GSEA/")
+for (FILE in list.files("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DE_GSEA/")) {
+WebGestaltR(enrichMethod="GSEA",
+              organism="hsapiens",
+              interestGeneFile=FILE,
+              projectName = FILE,
+              saveRawGseaResult=FALSE,
+              isOutput = TRUE,
+              minNum=10,
+              interestGeneType="genesymbol",
+              enrichDatabaseFile = "z:/Users/dnewho/Scripts/GSEA_GeneSets/Hallmarks_DDE_random.gmt",
+              enrichDatabaseType = "genesymbol",
+              sigMethod = "fdr", fdrMethod = "BH", fdrThr = 0.05, nThreads=8)
+}
+
+# Make a heatmap of the results
+setwd("Z:/Users/dnewho/O04_CyCMV/Ensembl.10.100_Analysis/DE_GSEA/")
+files <- dir(recursive=TRUE, full.names=TRUE, pattern="enrichment_results*")
+lst <- lapply(files, read.csv, header=TRUE, sep="\t", stringsAsFactors=FALSE)
+lst1 <- lapply(lst, "[", c("geneSet","normalizedEnrichmentScore"))
+
+DF <-as.data.frame(lst1[[1]])
+for ( .df in lst1 ) {
+  DF <-merge(DF,.df,by="geneSet", all=T)
+}
+
+DF<-avereps(x = DF,ID = DF$geneSet)
+
+DF[is.na(DF)] <- 0
+row.names(DF) <-DF[,1]
+#DF$description <- NULL
+DF <- DF[,c(-1,-2)] # removes "description" and duplicated first column
+
+colnames(DF) = files
+
+DFm<-as.matrix(DF)
+row.names(DFm)=sub("HALLMARK_", "", row.names(DFm)) 
+
+#DFm<-DFm[,c(4,1,2,3)]
+class(DFm)<-"numeric"
+breaksList=seq(-3.5, 3.5, by = .1)
+contrasting2 = colorRampPalette(rev(c("royalblue4","steelblue1","white","sienna1","darkred")))(100)
+DFm2<-DFm[,c(6,8:9,7,1:2,4,5,3,
+            15,17:18,16,10,11,13,14,12)]
+
+df = data.frame (
+  row.names = colnames(DFm2),
+  Outcome=rep(c("Protected","Unprotected"),each= 9) )
+
+annotation_colors = list(
+  Outcome=c(Protected="darkred", Unprotected="grey"))
+
+pdf("GSEA_DE_Heatmap.pdf",width = 10,height=10)
+pheatmap(DFm2,
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting2)))(length(breaksList)),
+         cluster_rows = T,
+         clustering_method = "average",
+         cluster_cols = F,
+         show_rownames = T, 
+         show_colnames = T,
+         border_color= "grey70", 
+         breaks = breaksList,
+        labels_col = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14",
+                       "D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+        gaps_col = 9,
+        cutree_rows = 3,
+          angle_col = 90,
+         fontsize = 12,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+        main=""
+         )
+dev.off()
+
+SupplementalFigure2<-DFm2
+colnames(SupplementalFigure2)<-c("Protected D1","Protected D3","Protected D7","Protected D14","Protected BD0","Protected BD1","Protected BD3","Protected BD7","Protected BD14",
+                       "Unprotected D1","Unprotected D3","Unprotected D7","Unprotected D14","Unprotected BD0","Unprotected BD1","Unprotected BD3","Unprotected BD7","Unprotected BD14")
+```
+
+## GSEA-DE: Leading Edge Gene heatmap
+```{r}
+GSEA_DE_LeadingEdge<-read.table("GSEA_DE_LeadingEdge_Genes.txt")
+GSEA_DE_LeadingEdge<-unique(GSEA_DE_LeadingEdge)
+
+GSEA_DE_LeadingEdge_ENSMUM<-merge(GSEA_DE_LeadingEdge,gene_list,by.x='V1',by.y='hsapiens_homolog_associated_gene_name',all=F)
+GSEA_DE_LeadingEdge_ENSMUM<-GSEA_DE_LeadingEdge_ENSMUM$ensembl_gene_id
+dm2<-as.data.frame(dataMatrix)
+cy_em_ensmum<-dm2[GSEA_DE_LeadingEdge_ENSMUM,]
+  
+  
+nm_hgnc<-merge(dataMatrix[GSEA_DE_LeadingEdge_ENSMUM,],gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+row.names(nm_hgnc)=nm_hgnc$hsapiens_homolog_associated_gene_name
+nm_hgnc$Row.names<-NULL
+nm_hgnc$hsapiens_homolog_ensembl_gene<-NULL
+nm_hgnc$hsapiens_homolog_associated_gene_name<-NULL
+
+# Let's add in Rhesus Expression from S group
+rhEM<-read.csv("Z:/Users/dnewho/Freddy_Protective_Signatue/SO_full_expression_matrix_de_lm.csv",row.names=1,header=T)
+rhEM<-rhEM[,c(1:8,17:24)] # S only
+rhEM[,c(8,16)]<-list(NULL) # Remove pre-infection time-points, since we don't have these in MCM
+rhEM_ensmum<-rhEM[GSEA_DE_LeadingEdge_ENSMUM,]
+rh_nm_hgnc<-merge(rhEM,gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+rh_nm_hgnc<-rh_nm_hgnc[rh_nm_hgnc$hsapiens_homolog_associated_gene_name %in% GSEA_DE_LeadingEdge$V1,]
+row.names(rh_nm_hgnc)=rh_nm_hgnc$hsapiens_homolog_associated_gene_name
+rh_nm_hgnc$Row.names<-NULL
+rh_nm_hgnc$hsapiens_homolog_ensembl_gene<-NULL
+rh_nm_hgnc$hsapiens_homolog_associated_gene_name<-NULL
+
+
+
+nm_hgnc_withRhesus<-cbind(nm_hgnc,rh_nm_hgnc)
+nm_ENSMUM_withRhesus<-cbind(cy_em_ensmum,rhEM_ensmum)
+
+# Add IL-15 Day 1 info
+il15_day1_em_leadingedge<-il15_day1_em[GSEA_DE_LeadingEdge_ENSMUM,]
+nm_ENSMUM_withRhesus_IL15<-cbind(nm_ENSMUM_withRhesus,il15_day1_em_leadingedge)
+nm_ENSMUM_withRhesus_IL15<-nm_ENSMUM_withRhesus_IL15[,c(1:18,33,19:32)]
+
+df = data.frame (
+  row.names = colnames(nm_ENSMUM_withRhesus_IL15),
+  Group=rep(c("Protected","Unprotected","IL-15","Protected","Unprotected"),c(9,9,1,7,7)),
+  Species=rep(c("MCM","MCM","RM","RM"),c(9,9,8,7))
+  )
+
+annotation_colors = list(
+  Group=c("Protected"="darkred", "Unprotected"="grey","IL-15"="black"),
+  Species=c("MCM"="tan4","RM"="darkslategray4")
+  )
+breaksList=seq(-2, 2, by = .1)
+contrasting3 = colorRampPalette(rev(c('darkblue', 'mediumblue', 'dodgerblue', 'white', 'orange', 'red', 'darkred')))(100)
+
+pdf("CyCMV_Heatmap_GSEA_DE_LEadingEdge_S.pdf",width = 8, height = 10)
+#png("CyCMV_Heatmap_RhIL15DDEgenes_withRhesus_S.png",width = 10, height = 5, units = 'in', res = 900)
+pheatmap(as.matrix(nm_ENSMUM_withRhesus_IL15),
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         clustering_method = "ward.D",
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = F, 
+         show_colnames = F,
+         #labels_col = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14",
+          #              "D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+         breaks = breaksList,
+         border_color="grey90", 
+         angle_col = "45",
+         cellwidth = 5,
+         cellheight = 2,
+         fontsize_number = 18,
+         fontsize = 12,
+         cutree_rows = 2,
+         gaps_col = c(9,18,19,26),
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="")
+dev.off()
+
+Figure1C<-nm_ENSMUM_withRhesus_IL15
+Figure1C<-rbind(Figure1C,t(df))
+Figure1C<-Figure1C[c(150,151,1:149),]
+```
+
+
+# Time point specific PCA - All Genes
+```{r}
+targetsPD0<-targets[targets["Time_Point"] ==  "D0", ]
+nm_PD0<-norm_matrix[,colnames(norm_matrix) %in%row.names(targetsPD0)]
+
+p <- pca(nm_PD0, 
+         metadata = targetsPD0)
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='black','Unprotected'='darkred'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       pointSize = 4,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+ggsave("PCA_PD0.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=8, height=6, 
+       dpi=900, limitsize=TRUE)
+
+
+#########
+targetsPD1<-targets[targets["Time_Point"] ==  "D1", ]
+nm_PD1<-norm_matrix[,colnames(norm_matrix) %in%row.names(targetsPD1)]
+
+p <- pca(nm_PD1, 
+         metadata = targetsPD1)
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='black','Unprotected'='darkred'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       pointSize = 4,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+ggsave("PCA_PD1.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=8, height=6, 
+       dpi=900, limitsize=TRUE)
+######
+targetsBD1<-targets[targets["Time_Point"] ==  "BD1", ]
+nm_BD1<-norm_matrix[,colnames(norm_matrix) %in%row.names(targetsBD1)]
+
+p <- pca(nm_BD1, 
+         metadata = targetsBD1)
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='black','Unprotected'='darkred'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       pointSize = 4,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+ggsave("PCA_BD1.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=8, height=6, 
+       dpi=900, limitsize=TRUE)
+```
+
+# Time point specific PCA - Rhesus IL15 Prot Genes
+```{r}
+rhil15<-read.csv("../../Freddy_Protective_Signatue/il15_dde.csv",header=T)
+rhil15=rhil15$gene
+rhil15<-intersect(rhil15,row.names(norm_matrix))
+
+targetsPD0<-targets[targets["Time_Point"] ==  "D0", ]
+nm_PD0<-norm_matrix[,colnames(norm_matrix) %in%row.names(targetsPD0)]
+
+p <- pca(nm_PD0[rhil15,], 
+         metadata = targetsPD0)
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='black','Unprotected'='darkred'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       pointSize = 4,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+ggsave("PCA_PD0_RhesusIL15.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=8, height=6, 
+       dpi=900, limitsize=TRUE)
+
+
+#########
+targetsPD1<-targets[targets["Time_Point"] ==  "D1", ]
+nm_PD1<-norm_matrix[,colnames(norm_matrix) %in%row.names(targetsPD1)]
+
+p <- pca(nm_PD1[rhil15,], 
+         metadata = targetsPD1)
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='black','Unprotected'='darkred'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       pointSize = 4,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+ggsave("PCA_PD1_RhesusIL15.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=8, height=6, 
+       dpi=900, limitsize=TRUE)
+######
+targetsBD1<-targets[targets["Time_Point"] ==  "BD1", ]
+nm_BD1<-norm_matrix[,colnames(norm_matrix) %in%row.names(targetsBD1)]
+
+p <- pca(nm_BD1[rhil15,], 
+         metadata = targetsBD1)
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       lab=NULL, 
+       colby='Outcome',
+       colkey = c('Protected'='black','Unprotected'='darkred'),
+       shape='Sex',
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       pointSize = 4,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+ggsave("PCA_BD1_RhesusIL15.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=8, height=6, 
+       dpi=900, limitsize=TRUE)
+```
+
+# Heatmap of GSEA DDE leading Edge Genes from Rhesus IL15
+```{r}
+rhil15_leadingedge<-read.table("GSEA_RhIL15_LeadingEdgeGenes.txt")
+
+mmulatta_ensembl <- useDataset("mmulatta_gene_ensembl", useMart("ensembl"))
+gene_list <- getBM(filters = "ensembl_gene_id", 
+                   attributes = c("ensembl_gene_id","hsapiens_homolog_ensembl_gene","hsapiens_homolog_orthology_type","hsapiens_homolog_associated_gene_name"),
+                   values = row.names(norm_matrix),mart = mmulatta_ensembl)
+gene_list<-gene_list[gene_list["hsapiens_homolog_orthology_type"] ==  "ortholog_one2one", ]
+gene_list$hsapiens_homolog_orthology_type<-NULL
+rhil15_leadingedge_ENSMUM<-merge(rhil15_leadingedge,gene_list,by.x='V1',by.y='hsapiens_homolog_associated_gene_name',all=F)
+rhil15_leadingedge_ENSMUM<-rhil15_leadingedge_ENSMUM$ensembl_gene_id
+
+nm_hgnc<-merge(dataMatrix[rhil15_leadingedge_ENSMUM,],gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+row.names(nm_hgnc)=nm_hgnc$hsapiens_homolog_associated_gene_name
+nm_hgnc$Row.names<-NULL
+nm_hgnc$hsapiens_homolog_ensembl_gene<-NULL
+nm_hgnc$hsapiens_homolog_associated_gene_name<-NULL
+
+contrasting3 = colorRampPalette(rev(c('darkblue', 'mediumblue', 'dodgerblue', 'white', 'orange', 'red', 'darkred')))(100)
+breaksList=seq(-3, 3, by = .1)
+
+df = data.frame (
+  row.names = colnames(nm_hgnc),
+  Outcome=rep(c("Protected","Unprotected"),each= 9) )
+
+annotation_colors = list(
+  Outcome=c(Protected="firebrick3", Unprotected="black"))
+
+
+png("CyCMV_Heatmap_RhIL15DDEgenes.png",width = 6, height = 15, units = 'in', res = 900)
+pheatmap(nm_hgnc,
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         clustering_method = "ward.D",
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = F, 
+         show_colnames = T,
+         labels_col = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14",
+                        "D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+         breaks = breaksList,
+        #  border_color="black", 
+         angle_col = "45",
+         #cellwidth = 20,
+         #cellheight = 20,
+         fontsize_number = 18,
+         fontsize = 18,
+         cutree_rows = 3,
+         gaps_col = 9,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="RhCMV IL-15/DDE \n Leading Edge Genes")
+dev.off()
+
+
+# Let's add in Rhesus Expression from S group
+rhEM<-read.csv("Z:/Users/dnewho/Freddy_Protective_Signatue/SO_full_expression_matrix_de_lm.csv",row.names=1,header=T)
+rhEM<-rhEM[,c(1:8,17:24)] # S only
+rhEM[,c(7,14)]<-list(NULL) # Remove pre-infection time-points, since we don't have these in MCM
+rh_nm_hgnc<-merge(rhEM,gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+rh_nm_hgnc<-rh_nm_hgnc[rh_nm_hgnc$hsapiens_homolog_associated_gene_name %in% rhil15_leadingedge$V1,]
+row.names(rh_nm_hgnc)=rh_nm_hgnc$hsapiens_homolog_associated_gene_name
+rh_nm_hgnc$Row.names<-NULL
+rh_nm_hgnc$hsapiens_homolog_ensembl_gene<-NULL
+rh_nm_hgnc$hsapiens_homolog_associated_gene_name<-NULL
+
+nm_hgnc_withRhesus<-cbind(nm_hgnc,rh_nm_hgnc)
+
+df = data.frame (
+  row.names = colnames(nm_hgnc_withRhesus),
+  Outcome=rep(c("Protected","Unprotected","Protected","Unprotected"),c(9,9,6,6)),
+  Species=rep(c("MCM","MCM","RM","RM"),c(9,9,6,6))
+  )
+
+annotation_colors = list(
+  Outcome=c("Protected"="darkred", "Unprotected"="grey"),
+  Species=c("MCM"="tan4","RM"="darkslategray4")
+  )
+breaksList=seq(-2, 2, by = .1)
+
+pdf("CyCMV_Heatmap_RhIL15DDEgenes_withRhesus_S.pdf",width = 10, height = 5)
+#png("CyCMV_Heatmap_RhIL15DDEgenes_withRhesus_S.png",width = 10, height = 5, units = 'in', res = 900)
+out<-pheatmap(as.matrix(nm_hgnc_withRhesus),
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         clustering_method = "ward.D",
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = F, 
+         show_colnames = F,
+         labels_col = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14",
+                        "D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+         breaks = breaksList,
+         border_color="grey90", 
+         angle_col = "45",
+         cellwidth = 5,
+         cellheight = 2,
+         fontsize_number = 18,
+         fontsize = 12,
+         cutree_rows = 3,
+         gaps_col = c(9,18,24),
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="")
+dev.off()
+
+# Extract Heatmap Clusters for IPA
+EM_Matrix<-as.matrix(nm_hgnc_withRhesus)
+rownames(EM_Matrix[out$tree_row[["order"]],])
+EM_Matrix<-as.matrix(sort(cutree(out$tree_row, k=3)))
+write.csv(EM_Matrix,"LEadingEdgeHEatmap_Clusters.csv")
+
+write.csv(nm_hgnc_withRhesus,"LeadingEdgeHeatmap_LFCvalues.csv")
+```
+
+# Plot a Barplot of IPA Pathway Results from 3 clusters
+```{r}
+Cluster1 <-read.xlsx("LeadingEdge_Cluster1_IPA_Results.xlsx",startRow = 2) # removes Qiagen copyright info in first line
+Cluster1<-Cluster1[1:5,]
+Cluster1$Ingenuity.Canonical.Pathways[3] <- "Role of Hypercytokinemia/hyperchemokinemia\nin the Pathogenesis of Influenza"
+Cluster1$Pathway <- factor(Cluster1$Ingenuity.Canonical.Pathways, levels = Cluster1$Ingenuity.Canonical.Pathways)
+
+
+Cluster2 <-read.xlsx("LeadingEdge_Cluster2_IPA_Results.xlsx",startRow = 2) # removes Qiagen copyright info in first line
+Cluster2<-Cluster2[1:5,]
+#iZ_pathways$Ingenuity.Canonical.Pathways[7] <- "Role of PRRs in Recognition of Bacteria and Viruses"
+Cluster2$Pathway <- factor(Cluster2$Ingenuity.Canonical.Pathways, levels = Cluster2$Ingenuity.Canonical.Pathways)
+
+Cluster3 <-read.xlsx("LeadingEdge_Cluster3_IPA_Results.xlsx",startRow = 2) # removes Qiagen copyright info in first line
+Cluster3<-Cluster3[1:5,]
+#iZ_pathways$Ingenuity.Canonical.Pathways[7] <- "Role of PRRs in Recognition of Bacteria and Viruses"
+Cluster3$Pathway <- factor(Cluster3$Ingenuity.Canonical.Pathways, levels = Cluster3$Ingenuity.Canonical.Pathways)
+
+AllClusters<-rbind(Cluster1,Cluster2,Cluster3)
+AllClusters$pval=AllClusters$`-log(p-value)`
+
+ggplot(AllClusters, aes(x = rev(Pathway), y = pval,fill="coral1")) +
+   # ggtitle("iZika")
+    theme_bw()+
+    scale_fill_manual(values = "coral") +
+   geom_col(colour = "black") +
+    coord_flip()+
+   scale_x_discrete(position="top")+
+   # geom_hline(yintercept = 1.3, linetype = 'longdash') +
+    geom_vline(xintercept = c(5.5,10.5),linetype="longdash")+
+      theme(legend.position="none",axis.title.y=element_blank(),axis.title.x=element_blank(),
+          axis.text.y = element_text(size=12, color = "black",face="bold"),
+          axis.text.x = element_text(size=14, color = "black",face="bold"),
+          axis.ticks = element_blank())+
+   theme(panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+  #scale_y_continuous(limits = c(0, 17))
+
+ggsave("LeadingEdge_IPA_Enrichment_BarPlot.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=13, height=8, 
+       dpi=900, limitsize=TRUE)
+
+ggplot(AllClusters, aes(x = rev(Pathway), y = pval,fill="coral1")) +
+    theme_bw()+
+    scale_fill_manual(values = "coral") +
+   geom_col(colour = "black") +
+    coord_flip()+
+   geom_hline(yintercept = 1.3, linetype = 'longdash') +
+    geom_vline(xintercept = c(5.5,10.5),linetype="solid")+
+      theme(legend.position="none",axis.title.y=element_blank(),axis.title.x=element_blank(),
+          axis.text.y = element_text(size=18, color = "black",face="bold"),
+          axis.text.x = element_text(size=18, color = "black",face="bold"),
+          axis.ticks = element_blank())+
+   theme(panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+  #scale_y_continuous(limits = c(0, 17))
+
+ggsave("LeadingEdge_IPA_Enrichment_BarPlot_Rownames.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=13, height=10, 
+       dpi=900, limitsize=TRUE)
+```
+
+# Baseline Z-score plots
+```{r}
+# Let's plot these genes at Baseline using z-scores of normalized expression. In RhCMV/SIV these genes separated outcome.
+norm_matrix_symbol<-merge(norm_matrix,gene_list,by.x='row.names',by.y='ensembl_gene_id',all=F)
+norm_matrix_symbol<-norm_matrix_symbol[,c(83,1:81)]
+norm_matrix_symbol$Row.names <-NULL
+norm_matrix_symbol <-avereps(norm_matrix_symbol,ID=norm_matrix_symbol$hsapiens_homolog_associated_gene_name)
+row.names(norm_matrix_symbol) <- norm_matrix_symbol[,1]
+norm_matrix_symbol <- norm_matrix_symbol[,-1]
+class(norm_matrix_symbol)<-"numeric"
+
+targetsPD0<-targets[targets["Time_Point"] ==  "D0", ]
+nm_PD0_symbol<-norm_matrix_symbol[,colnames(norm_matrix_symbol) %in%row.names(targetsPD0)]
+contrasting5 = colorRampPalette(c("slateblue4","slateblue3","white","olivedrab3","olivedrab4"))(100)
+
+
+df = data.frame (
+  row.names = colnames(nm_PD0_symbol[row.names(nm_hgnc),]),
+  Outcome=c("Unprotected","Protected","Protected","Unprotected",
+            "Protected","Protected","Unprotected","Unprotected") )
+
+annotation_colors = list(
+  Outcome=c(Protected="darkred", Unprotected="grey"))
+
+#png("CyCMV_Heatmap_RhIL15DDEgenes_BaselineZscore.png",width = 8, height = 5, units = 'in', res = 900)
+pdf("CyCMV_Heatmap_RhIL15DEgenes_BaselineZscore.pdf",width = 8, height = 5)
+pheatmap(nm_PD0_symbol[GSEA_DE_LeadingEdge$V1,],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting5)))(length(breaksList)),
+         clustering_method = "complete",
+         cluster_rows = T,
+         cluster_cols = T,
+         show_rownames = F, 
+         show_colnames = F,
+         #labels_col = c("D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14",
+          #              "D1","D3","D7","D14","BD0","BD1","BD3","BD7","BD14"),
+        # breaks = breaksList,
+        #  border_color="black", 
+         angle_col = "45",
+         #cellwidth = 20,
+         #cellheight = 20,
+         fontsize_number = 18,
+         fontsize = 18,
+         #cutree_rows = 3,
+         #gaps_col = 9,
+         annotation_col = df, 
+         annotation_colors = annotation_colors, 
+         main="")
+dev.off()
+
+scale_rows = function(x){
+     m = apply(x, 1, mean, na.rm = T)
+     s = apply(x, 1, sd, na.rm = T)
+     return((x - m) / s)
+}
+zscores<-scale_rows(nm_PD0_symbol[GSEA_DE_LeadingEdge$V1,])
+
+zscores_df<-as.data.frame(t(zscores))
+zscores_df$outcome<-targetsPD0$Outcome
+zscores_df<-melt(zscores_df)
+library(ggpubr)
+#
+png("CyCMV_BaselineZscore_Boxplot_GSEA_DE.png",width = 6, height = 6, units = 'in', res = 900)
+ggplot(zscores_df, aes(x = outcome, y = value,colour=outcome,fill="black")) + 
+  ggtitle("Baseline RM IL-15 x DDE\n in MCM") +
+  xlab("") + 
+  ylab("z-score") + 
+  scale_y_continuous()+ 
+  geom_boxplot(outlier.shape = NA,aes(alpha=1,fill = "white")) + 
+  geom_jitter(aes(alpha=1,fill = factor(outcome)),size = 3,pch=21,colour="black",position=position_jitterdodge()) +
+  scale_fill_manual(values=c('Protected'='darkred','Unprotected'='grey')) + 
+  scale_color_manual(values=c('Protected'='black','Unprotected'='black')) +
+  stat_compare_means()+
+  theme_classic() + 
+  theme(legend.position = "right",axis.text=element_text(size=14, angle=90,color="black"),
+                          axis.text.y = element_text(angle=0),
+                          axis.title=element_text(size=14,face="bold"), plot.title = element_text(hjust = 0.5),
+                          panel.border = element_rect(colour = "black", fill=NA, size=1))
+dev.off()
+
+# Split by up/down
+nm_PD0<-norm_matrix[,colnames(norm_matrix) %in%row.names(targetsPD0)]
+clustersup <- read.table("Z:/Users/dnewho/Freddy_Protective_Signatue/upIL15_dde", header = T, sep = ",")
+clustersup<-clustersup[,2]
+clustersdown <- read.table("Z:/Users/dnewho/Freddy_Protective_Signatue/downIL15_dde", header = T, sep = ",")
+clustersdown<-clustersdown[,2]
+
+downexpression <- GSEA_DE_LeadingEdge_ENSMUM[GSEA_DE_LeadingEdge_ENSMUM %in% clustersdown]
+upexpression <- GSEA_DE_LeadingEdge_ENSMUM[GSEA_DE_LeadingEdge_ENSMUM %in% clustersup]
+zscores_up<-scale_rows(nm_PD0[upexpression,])
+zscores_down<-scale_rows(nm_PD0[downexpression,])
+
+zscores_up_df<-as.data.frame(t(zscores_up))
+zscores_up_df$outcome<-targetsPD0$Outcome
+zscores_up_df<-melt(zscores_up_df)
+
+zscores_down_df<-as.data.frame(t(zscores_down))
+zscores_down_df$outcome<-targetsPD0$Outcome
+zscores_down_df<-melt(zscores_down_df)
+
+pdf("CyCMV_BaselineZscore_UpGenes_Boxplot_GSEA_DE.pdf",width = 4, height = 4)
+#png("CyCMV_BaselineZscore_UpGenes_Boxplot.png",width = 6, height = 6, units = 'in', res = 900)
+ggplot(zscores_up_df, aes(x = outcome, y = value,colour=outcome,fill="black")) + 
+  ggtitle("Baseline RM IL-15 x DDE Up\nin MCM") +
+  xlab("") + 
+  ylab("z-score") + 
+  scale_y_continuous()+ 
+  geom_boxplot(outlier.shape = NA,aes(alpha=1,fill = "white")) + 
+  geom_jitter(aes(alpha=1,fill = factor(outcome)),size = 3,pch=21,colour="black",position=position_jitterdodge()) +
+scale_fill_manual(values=c('Protected'='darkred','Unprotected'='grey')) + 
+  scale_color_manual(values=c('Protected'='black','Unprotected'='black')) +
+  stat_compare_means()+
+  theme_classic() + 
+  theme(legend.position = "none",axis.text=element_text(size=14, angle=90,color="black"),
+                          axis.text.y = element_text(angle=0),
+                          axis.text.x = element_text(angle=0),
+                          axis.title=element_text(size=14,face="bold"), plot.title = element_text(hjust = 0.5),
+                          panel.border = element_rect(colour = "black", fill=NA, size=1))
+dev.off()
+
+pdf("CyCMV_BaselineZscore_DownGenes_Boxplot_GSEA_DE.pdf",width = 4, height = 4)
+#png("CyCMV_BaselineZscore_DownGenes_Boxplot.png",width = 6, height = 6, units = 'in', res = 900)
+ggplot(zscores_down_df, aes(x = outcome, y = value,colour=outcome,fill="black")) + 
+  ggtitle("Baseline RM IL-15 x DDE Down\nin MCM") +
+  xlab("") + 
+  ylab("z-score") + 
+  scale_y_continuous()+ 
+  geom_boxplot(outlier.shape = NA,aes(alpha=1,fill = "white")) + 
+  geom_jitter(aes(alpha=1,fill = factor(outcome)),size = 3,pch=21,colour="black",position=position_jitterdodge()) +
+scale_fill_manual(values=c('Protected'='darkred','Unprotected'='grey')) + 
+  scale_color_manual(values=c('Protected'='black','Unprotected'='black')) +
+  stat_compare_means()+
+  theme_classic() + 
+  theme(legend.position = "none",axis.text=element_text(size=14, angle=90,color="black"),
+                          axis.text.y = element_text(angle=0),
+                          axis.text.x = element_text(angle=0),
+                          axis.title=element_text(size=14,face="bold"), plot.title = element_text(hjust = 0.5),
+                          panel.border = element_rect(colour = "black", fill=NA, size=1))
+dev.off()
+
+Figure1D_Up<-zscores_up_df
+Figure1D_Down<-zscores_down_df
+```
+
+```{r}
+  geom_dotplot(binaxis = "y", stackdir = "center")
+
+ggplot(zscores_down_df, aes(x = outcome, y = value,colour=outcome,fill="black")) + 
+  ggtitle("Baseline RM IL-15 x DDE Down\nin MCM") +
+  xlab("") + 
+  ylab("z-score") + 
+  scale_y_continuous()+ 
+  geom_boxplot(outlier.shape = NA,aes(alpha=1,fill = "white")) + 
+  #geom_jitter(aes(alpha=1,fill = factor(outcome)),size = 3,pch=21,colour="black",position=position_jitterdodge()) +
+scale_fill_manual(values=c('Protected'='darkred','Unprotected'='black')) + 
+  scale_color_manual(values=c('Protected'='darkred','Unprotected'='black')) +
+    geom_dotplot(aes(alpha=1,fill = factor(outcome)),size = 3,colour="black",binaxis = "y", stackdir = "center")
+  stat_compare_means()+
+  theme_classic() + 
+  theme(legend.position = "none",axis.text=element_text(size=14, angle=90,color="black"),
+                          axis.text.y = element_text(angle=0),
+                          axis.text.x = element_text(angle=0),
+                          axis.title=element_text(size=14,face="bold"), plot.title = element_text(hjust = 0.5),
+                          panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+```
+
+# Boxplot of IL-15 Expression
+```{r}
+
+IL15plot <-norm_matrix[grep("ENSMMUG00000019092", rownames(norm_matrix)), ]
+
+IL15plot<-as.data.frame(t(IL15plot))
+IL15plot <-IL15plot[,grep("_D0_", colnames(IL15plot))]
+
+IL15plot<-reshape2::melt(as.matrix(IL15plot))
+IL15plot$outcome<-c("Unprotected","Protected","Protected","Unprotected",
+                    "Protected","Protected","Unprotected","Unprotected")
+
+
+ggplot(IL15plot, aes(x = outcome, y = value,fill=outcome)) + 
+  ggtitle("IL-15 Baseline Expression", subtitle = "") +
+  xlab("") + 
+  ylab("Normalized Expression") + 
+  scale_y_continuous()+ 
+  geom_jitter(aes(alpha=1),size = 4,shape = 21, position = position_jitterdodge(jitter.width = 0.25)) +  
+  geom_boxplot(aes(alpha=0.3),outlier.shape = NA,position=position_dodge(1)) + 
+scale_fill_manual(values=c('Protected'='darkred','Unprotected'='black')) + 
+  scale_color_manual(values=c('Protected'='darkred','Unprotected'='black')) +
+  theme_classic() + theme(legend.position = "right",
+                          axis.text=element_text(size=18, angle=90,color="black"),
+                          axis.title=element_text(size=18,face="bold"), plot.title = element_text(hjust = 0.5),
+                          panel.border = element_rect(colour = "black", fill=NA, size=1))+
+  theme(legend.position = "none",axis.text=element_text(size=14, angle=90,color="black"),
+                          axis.text.y = element_text(angle=0),
+                          axis.text.x = element_text(angle=0),
+                          axis.title=element_text(size=14,face="bold"), plot.title = element_text(hjust = 0.5),
+                          panel.border = element_rect(colour = "black", fill=NA, size=1))+
+    stat_compare_means()
+
+
+ggsave("IL15_Baseline_Expression.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=7, height=7, 
+       dpi=900, limitsize=TRUE)
+```
+
+# Output Figure Data
+```{r}
+FigureData <- list( "Figure 1A"=Figure1A,
+                    "Figure 1B"=Figure1B,
+                    "Figure 1C"=Figure1C,
+                    "Figure 1D Up"=Figure1D_Up,
+                    "Figure 1D Down"=Figure1D_Down,
+                    "Supplemental Figure 1"=as.data.frame(SupplementalFigure1),
+                    "Supplemental Figure 2"=SupplementalFigure2
+                         
+                         )
+write.xlsx(FigureData, file = "CyCMV_RNAseq_FigureData_11122021.xlsx",firstRow=T,firstCol=T,
+           colnNames=T,rowNames=T)
+
+# Write Supplemental DE Results with Gene Symbols
+DEresults<-read.csv("CyCMV_fullDE_results.csv",header=T, row.names=1)
+DEresults_HGNC<-merge(DEresults,gene_list,by.x="row.names",by.y="ensembl_gene_id")
+DEresults_HGNC<-DEresults_HGNC[,c(1,77,78,2:76)]
+DEresults_HGNC <- data.frame(DEresults_HGNC, row.names = 1)
+
+Supplemental_DE_Results <- list( "Full DE Results"=DEresults,
+                                  "DE Results, Human Orthologs"=DEresults_HGNC)
+
+
+
+write.xlsx(Supplemental_DE_Results, file = "CyCMV_RNAseq_SupplementalDifferentialExpressionResults.xlsx",
+           firstRow=T, firstCol=T,
+           colnNames=T,rowNames=T)
+```
+
